@@ -45,3 +45,11 @@ $RECYCLE.BIN/
 Network Trash Folder
 Temporary Items
 .apdisk
+
+.spyproject/
+__pycache__
+1Pr_NaLaF4_17h_0m_700i_900s.ptu
+1Pr_NaLaF4_2d_16h_13m_900i_700s.ptu
+*.ptu
+photon_correlation.7z
+*.tt2

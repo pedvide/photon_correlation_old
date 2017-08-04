@@ -1,0 +1,1 @@
+FCS-correlation.exe -o out.txt -c 1 -C 0 -L -l -200e-6 -u 200e-6 -n 400 -i 1Pr_NaLaF4_92min_300cps.ptu

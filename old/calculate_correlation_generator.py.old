@@ -1,0 +1,313 @@
+# -*- coding: utf-8 -*-
+"""
+Calculate the correlation between photon arrival times in two detectors
+
+Created by Mathijs de Jong, modified by Pedro Villanueva 2016-2017.
+"""
+
+# import packages
+import numpy as np
+import struct
+import time
+#import sys
+import os
+from collections import namedtuple
+
+import matplotlib.pyplot as plt
+import itertools as it
+from tqdm import trange
+
+
+# tuples of photon time and detector type (SYNC=0, INPUT=1)
+Photon = namedtuple('Photon', ['time', 'type'])
+
+# functions
+def log(message):
+    msg = time.strftime("%X",time.localtime()) + ': ' + str(message)
+    print(msg)
+    log_file.write(msg + "\n")
+
+def debug(message):
+    msg = time.strftime("%X", time.localtime()) + ': DEBUG: ' + str(message)
+    log_file.write(msg + "\n")
+
+
+def plot_histogram(histogram, figure=None):
+    '''Plot the histogram.'''
+    # plot histogram
+    fig = figure or plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(histogram[:, 0], histogram[:, 1], '.')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Correlation')
+    plt.ticklabel_format(style='sci', axis='x', scilimits=(0,0), useMathText=True)
+    plt.show()
+
+
+def iterate_header(data_file):
+    # tag types
+    tyEmpty8      = int('FFFF0008', 16)
+    tyBool8       = int('00000008', 16)
+    tyInt8        = int('10000008', 16)
+    tyBitSet64    = int('11000008', 16)
+    tyColor8      = int('12000008', 16)
+    tyFloat8      = int('20000008', 16)
+    tyTDateTime   = int('21000008', 16)
+    tyFloat8Array = int('2001FFFF', 16)
+    tyAnsiString  = int('4001FFFF', 16)
+    tyWideString  = int('4002FFFF', 16)
+    tyBinaryBlob  = int('FFFFFFFF', 16)
+
+    # parse header
+    magic_number = data_file.read(8).decode('ascii').strip('\x00').strip()
+    debug('File format: ' + magic_number)
+    if 'PQTTTR' not in magic_number:
+        debug('ERROR, WRONG FILE FORMAT! ({})'.format(magic_number))
+        raise ValueError('Wrong file format')
+    version = data_file.read(8).decode('ascii')
+    debug('Version: ' + version)
+
+    tag_id = ''
+    while 'Header_End' not in tag_id:
+         # identity, string
+        tag_id = data_file.read(32).decode('ascii').strip('\x00').strip()
+        # position in array, or -1 if not an array, int32
+        tag_pos_array = struct.unpack('i', data_file.read(4))[0]
+        # type of tag, uint32
+        tag_type = struct.unpack('I', data_file.read(4))[0]
+
+        if tag_pos_array != -1:  # array element
+            tag_id += '({})'.format(tag_pos_array)
+
+        if tag_type == tyEmpty8:  # empty value
+            data_file.read(8)
+            tag_value = ''
+            debug(tag_id + '(Empty)')
+        elif tag_type == tyBool8:  # bool value
+            tag_value = bool(struct.unpack('q', data_file.read(8))[0])
+            debug(tag_id + ' = tyBool8: {}'.format(tag_value))
+        elif tag_type == tyInt8:  # integer
+            tag_value = struct.unpack('q', data_file.read(8))[0]
+            debug(tag_id + ' = tyInt8: {}'.format(tag_value))
+        elif tag_type == tyBitSet64:  # integer
+            tag_value = struct.unpack('q', data_file.read(8))[0]
+            debug(tag_id + ' = tyBitSet64: {}'.format(tag_value))
+        elif tag_type == tyColor8:  # RGB
+            tag_value = struct.unpack('q', data_file.read(8))[0]
+            debug(tag_id + ' = tyColor8: {}'.format(tag_value))
+        elif tag_type == tyFloat8:  # double
+            tag_value = struct.unpack('d', data_file.read(8))[0]
+            debug(tag_id + ' = tyFloat8: {}'.format(tag_value))
+        elif tag_type == tyTDateTime:  # datetime
+            tag_value = struct.unpack('d', data_file.read(8))[0]
+            debug(tag_id + ' = tyTDateTime: {}'.format(tag_value))
+        elif tag_type == tyFloat8Array:  # array of float8
+            tag_value = struct.unpack('q', data_file.read(8))[0]
+            debug(tag_id + ' = tyFloat8Array with {} entries'.format(tag_value))
+        elif tag_type == tyAnsiString:  # ASCII string
+            tag_len = struct.unpack('q', data_file.read(8))[0]
+            tag_value = data_file.read(tag_len).decode('ascii').strip('\x00').strip()
+            debug(tag_id + ' = tyAnsiString: {}'.format(tag_value))
+        elif tag_type == tyWideString:  # wide string
+            tag_len = struct.unpack('q', data_file.read(8))[0]
+            tag_value = data_file.read(tag_len).decode('ascii').strip('\x00').strip()
+            debug(tag_id + ' = tyWideString: {}'.format(tag_value))
+        elif tag_type == tyBinaryBlob:  # binary data
+            tag_len = struct.unpack('q', data_file.read(8))[0]
+            tag_value = data_file.read(tag_len)
+            debug(tag_id + ' = tyBinaryBlob with {} bytes'.format(tag_len))
+        else:
+            debug('Error, wrong tag type: {}, id: {}'.format(tag_type, tag_id))
+            raise ValueError('Error, wrong tag type: {}, id: {}'.format(tag_type, tag_id))
+
+        yield (tag_id, tag_value, data_file.tell())
+
+    yield ('end_header_pos', data_file.tell(), data_file.tell())
+
+def parse_ptu_header(filename):
+    # (SubID = $00, RecFmt: $01) (V1), T-Mode: $02 (T2), HW: $06 (TimeHarp260P)
+    rtTimeHarp260PT2 = int('00010206', 16)
+
+    with open(filename, 'rb') as data_file:
+        header = {tag_id: tag_value for tag_id, tag_value, _ in iterate_header(data_file)}
+
+    if header['TTResultFormat_TTTRRecType'] != rtTimeHarp260PT2:
+        msg = 'File was not measured on a TimeHarp 260 Pico'
+        log(msg)
+        raise ValueError(msg)
+    return header
+
+
+def fix_ptu_header(filename, new_items):
+    with open(filename, 'r+b') as ptu_file:
+        for tag_id, tag_value, position in iterate_header(ptu_file):
+            if tag_id in new_items:
+                binary_data = struct.pack('q', new_items[tag_id])
+                write_position = position-len(binary_data)
+                debug('Writing {} to {} at {}'.format(new_items[tag_id], tag_id, write_position))
+                ptu_file.seek(write_position, os.SEEK_SET)
+                ptu_file.write(binary_data)
+
+
+def get_photon(data_file, header, stats={}):
+    overflow = 0
+    synccnt = 0
+    inputcnt = 0
+
+    num_events = header['TTResult_NumberOfRecords']
+    resolution = header['MeasDesc_GlobalResolution']
+    end_header_pos = header['end_header_pos']
+    data_file.seek(end_header_pos)
+
+    EVENT_TIME_CHANGE = '1111111'
+    EVENT_PHOTON_SYNC = '1000000'
+    EVENT_PHOTON_INPUT = '0000000'
+
+    for event_index in trange(num_events, total=num_events,
+                              desc='Calculating correlation',
+                              unit='events'):
+        # convert data to binary text
+        event_data = format(struct.unpack('I', data_file.read(4))[0],'032b')
+        event_type = event_data[0:7]
+        event_time = int(event_data[-25:], 2)  # in ps (since last overflow)
+        if event_type == EVENT_TIME_CHANGE:  # time change
+            if event_time == 0:
+                overflow += 1
+            else:
+                overflow += event_time
+            continue
+        elif event_type == EVENT_PHOTON_SYNC:  # photon event at SYNC
+            synccnt += 1
+            yield Photon(resolution*(overflow*2**25 + event_time), 0)
+        elif event_type == EVENT_PHOTON_INPUT:  # photon event at INPUT
+            inputcnt += 1
+            yield Photon(resolution*(overflow*2**25 + event_time), 1)
+        else:
+            raise ValueError('Unknown event type in get_photon.')
+
+    stats['overflow'] = overflow
+    stats['synccnt'] = synccnt
+    stats['inputcnt'] = inputcnt
+
+
+def get_photon_list(get_photon, max_delta_t=200e-6):
+    '''Generates lists of Photons for which the time difference between the first and last
+        is smaller than max_delta_t. It then advances to the next photon and repeats.
+        get_photon generates the individual photons.'''
+    # remove the first photon, add new ones at the back until the difference is max_delta_t
+    # yield the resulting list and repeat until there are no more photons.
+
+    photon_corr_list = [None]
+    while True:
+        del photon_corr_list[0]
+
+        # get first photon
+        if len(photon_corr_list) == 0:
+            try:
+                first_photon = next(get_photon)
+            except StopIteration:
+                return
+        else:
+            first_photon = photon_corr_list[0]
+
+        condition = lambda photon: np.abs(first_photon.time - photon.time) < max_delta_t
+        rest_list = list(it.takewhile(condition, get_photon))
+        photon_corr_list = [first_photon] + rest_list
+        print(len(photon_corr_list))
+        yield photon_corr_list
+
+
+def update_hist(hist, photon_list):
+    '''Updates the histogram with the correlation between
+    the first photon and the rest of the photons in the list'''
+    # process the list to calculate histogram
+    first_photon = photon_list[0]
+    for photon in photon_list[1:]:
+        if first_photon.type == 0 and photon.type == 1:
+            dif = (photon.time - first_photon.time)/bin_width
+            locdif = int(dif) + hist_len//2
+            hist[locdif] += 1
+        elif first_photon.type == 1 and photon.type == 0:
+            dif = (first_photon.time - photon.time)/bin_width
+            locdif = int(dif) + hist_len//2-1
+            hist[locdif] += 1
+
+
+def calculate_correlation(data_file, bin_width, hist_len, header):
+    hist = [0]*hist_len
+    max_delta_t = 200e-6  # in s, maximum time difference to calculate correlation
+    stats = {}
+
+    get_photon_gen = get_photon(data_file, header, stats)
+    get_photon_list_gen = get_photon_list(get_photon_gen, max_delta_t)
+
+    for photon_list in get_photon_list_gen:
+        update_hist(hist, photon_list)
+
+    overflow = stats['overflow']
+    synccnt = stats['synccnt']
+    inputcnt = stats['inputcnt']
+    return (hist, overflow, synccnt, inputcnt)
+
+
+# starting of script
+start_time = time.time()
+log_file = open("dataloading.log","w",1)
+log("Script started")
+
+filename = '1Pr_NaLaF4_1h_20m_300i_400s_splitter.ptu'
+
+hist_len = 400  # bins
+bin_width = 1e-6  # in seconds
+hist_time = (np.linspace(-hist_len//2+1, hist_len//2, num=hist_len)-1)*bin_width # time in s
+
+header = parse_ptu_header(filename)
+num_events = header['TTResult_NumberOfRecords']
+resolution = header['MeasDesc_GlobalResolution']
+exp_time = header['TTResult_StopAfter']*1e-3  # in s
+
+log("Number of events: {}".format(num_events))
+
+# if the header is wrong, fix it
+if num_events == 0:
+    log('Fxing number of events in header')
+    file_size = os.path.getsize(filename)
+    data_size = file_size - header['end_header_pos']
+    num_events = int(data_size/header['TTResultFormat_BitsPerRecord'])
+    header['TTResult_NumberOfRecords'] = num_events
+    new_items = {'TTResult_NumberOfRecords': num_events}
+    fix_ptu_header(filename, new_items)
+    log("New number of events: {}".format(num_events))
+#
+# prepare reading data file
+with open(filename, "rb") as data_file:
+    # calculate correlation
+    (hist, overflow, synccnt, inputcnt) = calculate_correlation(data_file, bin_width,
+                                                                hist_len, header)
+
+log("Finished calculating correlation.")
+
+# normalize histogram
+totalcnt = synccnt + inputcnt
+total_time = resolution*overflow*2**25
+norm_factor = synccnt * inputcnt / total_time * bin_width
+norm_hist = np.array(hist)/norm_factor
+full_hist = np.array(np.column_stack((hist_time, norm_hist)))
+
+# log some info to file
+log("Counts on SYNC: {}.".format(synccnt))
+log("Counts on INPUT: {}.".format(inputcnt))
+log('Experimental time {:.1f} s.'.format(total_time))
+
+# write results to file
+with open('correlationnew.txt', 'wt') as output_file:
+    output_file.write('# time in seconds, counts normalized\n')
+    for bin_time, bin_count in full_hist:
+        output_file.write("{:e}\t{:f}\n".format(bin_time, bin_count))
+
+# finish script
+log("Calculation time: {:.1f} s.".format(time.time() - start_time))
+log_file.close()
+
+# plot histogram
+plot_histogram(full_hist)
